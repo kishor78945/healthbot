@@ -1,6 +1,25 @@
-.env
+# Python
 __pycache__/
 *.pyc
-*.pkl
-.vscode/
-.idea/
+*.pyo
+*.pyd
+env/
+venv/
+.env
+.DS_Store
+
+# Large data and local stores (optional — if you want them in the repo remove these)
+media_files/
+emb_batches/
+faiss_index.bin
+all_chunks.json
+doc_sources.json
+emb_meta.json
+alerts_queue.json
+subscribers.json
+last_seen.json
+seen_users.json
+healthbot.log
+
+# Colab/drive
+/content/drive/
