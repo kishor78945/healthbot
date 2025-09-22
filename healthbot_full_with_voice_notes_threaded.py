@@ -40,31 +40,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 import atexit
 from pydub import AudioSegment
 from gtts import gTTS
+# remove getpass import (no interactive prompts in cloud)
+# from getpass import getpass   <- delete this line
 
-# ============= STEP 3: Credentials (prompt if not in env) ============
-if not os.environ.get("NVIDIA_API_KEY"):
-    try:
-        val = getpass("Enter NVIDIA API KEY: ")
-    except Exception:
-        val = None
-    if val: os.environ["NVIDIA_API_KEY"] = val
-
-if not os.environ.get("TWILIO_ACCOUNT_SID"):
-    try:
-        val = getpass("Enter Twilio Account SID: ")
-    except Exception:
-        val = None
-    if val: os.environ["TWILIO_ACCOUNT_SID"] = val
-
-if not os.environ.get("TWILIO_AUTH_TOKEN"):
-    try:
-        val = getpass("Enter Twilio Auth Token: ")
-    except Exception:
-        val = None
-    if val: os.environ["TWILIO_AUTH_TOKEN"] = val
-
+# environment-driven config (no interactive prompts)
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN") or (getpass("Enter ngrok authtoken (optional): ") if os.environ.get("COLAB_GPU") else os.environ.get("NGROK_AUTHTOKEN", ""))
+NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # set in environment if you need ngrok
 
 # Toggle these depending on environment:
 SKIP_TWILIO_VALIDATION = True   # set False in production
