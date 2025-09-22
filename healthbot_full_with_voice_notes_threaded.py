@@ -868,26 +868,47 @@ scheduler.start()
 atexit.register(lambda: scheduler.shutdown(wait=False))
 logging.info("Scheduler started")
 
-# ------------- ngrok + run -------------
-try:
-    if NGROK_AUTHTOKEN and NGROK_AUTHTOKEN.strip() and NGROK_AUTHTOKEN != "<YOUR_NGROK_AUTHTOKEN_OR_LEAVE_EMPTY>":
-        try:
-            ngrok_conf.get_default().auth_token = NGROK_AUTHTOKEN
-        except Exception:
-            os.system(f"ngrok config add-authtoken {NGROK_AUTHTOKEN}")
+# ------------- ngrok (only for local/Colab) + run -------------
+def _maybe_start_ngrok():
+    # Start ngrok only if we're not running on a platform that provides $PORT (i.e. local dev / Colab)
+    port_env = os.environ.get("PORT")
+    if port_env:
+        # running on a platform (Render/Heroku) — do not start ngrok here
+        return None
     try:
-        ngrok.kill()
-    except Exception:
-        pass
-    public_tunnel = ngrok.connect(5000)
-    globals()["public_tunnel"] = public_tunnel
-    print("ngrok public url:", public_tunnel.public_url)
-    print("Set Twilio webhook to:", public_tunnel.public_url + "/whatsapp")
-except Exception as e:
-    logging.exception("ngrok not started: %s", e)
-    print("ngrok not started:", e)
+        if NGROK_AUTHTOKEN and NGROK_AUTHTOKEN.strip() and NGROK_AUTHTOKEN != "<YOUR_NGROK_AUTHTOKEN_OR_LEAVE_EMPTY>":
+            try:
+                ngrok_conf.get_default().auth_token = NGROK_AUTHTOKEN
+            except Exception:
+                # fallback: try system call
+                os.system(f"ngrok config add-authtoken {NGROK_AUTHTOKEN}")
+        try:
+            ngrok.kill()
+        except Exception:
+            pass
+        # expose local Flask port (default 5000)
+        public_tunnel = ngrok.connect(5000)
+        globals()["public_tunnel"] = public_tunnel
+        print("ngrok public url:", public_tunnel.public_url)
+        print("Set Twilio webhook to:", public_tunnel.public_url + "/whatsapp")
+        return public_tunnel
+    except Exception as e:
+        logging.exception("ngrok not started: %s", e)
+        return None
 
-print("Starting Flask app on port 5000")
+# Only start Flask when this file is executed directly.
 if __name__ == '__main__':
-    # Use host 0.0.0.0 in container/colab; locally you can omit host
-    app.run(host="0.0.0.0", port=5000)
+    # start ngrok only for local runs (not on Render)
+    _maybe_start_ngrok()
+
+    # Use PORT from environment if present (Render, Heroku, etc). Fallback to 5000 for local dev.
+    port = int(os.environ.get("PORT", 5000))
+    host = "0.0.0.0"
+
+    print(f"Starting Flask app on {host}:{port}")
+    try:
+        app.run(host=host, port=port)
+    except Exception as e:
+        logging.exception("Failed to start Flask: %s", e)
+        raise
+
