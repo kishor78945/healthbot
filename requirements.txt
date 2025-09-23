@@ -14,3 +14,4 @@ requests
 ffmpeg-python
 av
 imageio-ffmpeg
+openai>=1.0.0
