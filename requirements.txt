@@ -17,4 +17,5 @@ python-dotenv
 openai-whisper
 ffmpeg-python
 av
+imageio-ffmpeg
 
