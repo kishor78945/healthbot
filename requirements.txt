@@ -3,13 +3,14 @@ gunicorn
 numpy
 sentence-transformers
 pypdf
-py-dub
+pydub
 gTTS
 twilio
+feedparser
 apscheduler
 langdetect
-requests
 python-dotenv
+requests
 ffmpeg-python
 av
 imageio-ffmpeg
