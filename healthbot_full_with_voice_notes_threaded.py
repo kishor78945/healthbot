@@ -20,6 +20,7 @@ from twilio.rest import Client as TwilioClient
 from twilio.request_validator import RequestValidator
 import atexit
 
+
 # Optional Colab imports (safe if not present)
 try:
     from google.colab import files, drive  # type: ignore
@@ -42,6 +43,15 @@ LOG_PATH = os.environ.get("HEALTHBOT_LOG_PATH", "/tmp/healthbot.log")
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger().addHandler(logging.StreamHandler())  # also log to stdout
 logging.info("HealthBot starting (log -> %s)", LOG_PATH)
+# Ensure ffmpeg binary available via imageio-ffmpeg (works on Render)
+try:
+    import imageio_ffmpeg as _iioff
+    FFMPEG_BINARY = _iioff.get_ffmpeg_exe()
+    logging.info("Using ffmpeg from imageio-ffmpeg: %s", FFMPEG_BINARY)
+except Exception:
+    FFMPEG_BINARY = "ffmpeg"  # fallback to system ffmpeg if available in PATH
+    logging.info("imageio-ffmpeg not available; will try system ffmpeg")
+
 
 # Twilio and ngrok / public tunnel
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
@@ -310,20 +320,35 @@ def set_pref_if_script_detected(sender, incoming_msg):
 
 # ----------------- Audio preprocess & ASR helpers -----------------
 def _preprocess_audio(in_path, out_path, sample_rate=16000):
+    """
+    Preprocess audio with ffmpeg: resample, mono, apply light high-pass + loudness normalization.
+    Attempts the full filterchain, falls back to a simpler resample if the filter fails.
+    Returns the output path (or original path if both attempts fail).
+    """
     try:
-        cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", str(sample_rate), "-af", "highpass=f=80,dynaudnorm", out_path]
+        # Preferred: highpass + loudness normalization (dynaudnorm). Works with most ffmpeg builds.
+        cmd = [
+            FFMPEG_BINARY, "-y", "-i", in_path,
+            "-ac", "1", "-ar", str(sample_rate),
+            "-af", "highpass=f=80,dynaudnorm",
+            "-f", "wav",
+            out_path
+        ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return out_path
     except Exception:
-        logging.exception("ffmpeg preprocess failed, falling back to pydub")
+        logging.exception("ffmpeg preprocess (with filters) failed; trying simpler resample fallback")
         try:
-            from pydub import AudioSegment
-            audio = AudioSegment.from_file(in_path)
-            audio = audio.set_channels(1).set_frame_rate(sample_rate)
-            audio.export(out_path, format="wav")
+            cmd2 = [
+                FFMPEG_BINARY, "-y", "-i", in_path,
+                "-ac", "1", "-ar", str(sample_rate),
+                "-f", "wav",
+                out_path
+            ]
+            subprocess.run(cmd2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return out_path
         except Exception:
-            logging.exception("fallback preprocess failed")
+            logging.exception("ffmpeg preprocess fallback failed; returning original path")
             return in_path
 
 def _download_media(media_url, save_path):
@@ -344,15 +369,26 @@ def _download_media(media_url, save_path):
         logging.exception("Failed to download media %s", media_url)
         raise
 
-def _convert_to_wav(in_path, out_path):
+def _convert_to_wav(in_path, out_path, sample_rate=16000):
+    """
+    Convert arbitrary media file to WAV using the FFMPEG_BINARY.
+    Returns out_path on success, otherwise returns in_path (best-effort).
+    """
     try:
-        from pydub import AudioSegment
-        audio = AudioSegment.from_file(in_path)
-        audio.export(out_path, format="wav")
+        # Build ffmpeg command to decode any container -> mono 16k WAV
+        cmd = [
+            FFMPEG_BINARY, "-y", "-i", in_path,
+            "-ac", "1", "-ar", str(sample_rate),
+            "-vn",  # no video
+            "-f", "wav",
+            out_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return out_path
     except Exception:
-        logging.exception("convert_to_wav failed; returning original path")
+        logging.exception("ffmpeg convert_to_wav failed; returning original path")
         return in_path
+
 
 def _detect_lang_from_text(txt):
     try:
@@ -769,7 +805,7 @@ def handle_incoming_voice_media_process_only(sender, media_url, content_type):
         logging.exception("handle_incoming_voice_media_process_only failed")
         return {"success": False, "error": "exception"}
 
-# ----------------- Background worker to process voice note and send via REST -----------------
+
 # ----------------- Background worker to process text and send via REST -----------------
 def _process_text_and_send_async(sender, incoming_msg):
     try:
@@ -815,6 +851,53 @@ def _process_text_and_send_async(sender, incoming_msg):
 
     except Exception:
         logging.exception("BG: unexpected failure processing text for %s", sender)
+
+def _process_voice_and_send_async(sender, media_url, content_type):
+    try:
+        logging.info("BG: starting voice processing for %s", sender)
+        result = handle_incoming_voice_media_process_only(sender, media_url, content_type)
+
+        if not result or not result.get("success"):
+            logging.warning("BG: voice processing failed for %s: %s", sender, result)
+            if not SKIP_PERSISTENT_SEND:
+                tw = get_twilio_client()
+                if tw:
+                    _twilio_send_and_log(
+                        tw.messages.create,
+                        body="❌ Sorry, couldn't process your voice note. Please try text or resend.",
+                        from_=TWILIO_WHATSAPP_FROM,
+                        to=sender
+                    )
+            return
+
+        transcript = result.get("transcript", "")
+        answer = result.get("answer") or TRANSLATIONS["fallback"].get(result.get("lang") or "en")
+        body_for_send = f"🎤 You said: {transcript}\n\n💬 Answer: {answer}"
+
+        if not SKIP_PERSISTENT_SEND:
+            tw = get_twilio_client()
+            if tw:
+                _twilio_send_and_log(
+                    tw.messages.create,
+                    body=body_for_send[:1600] + "..." if len(body_for_send) > 1600 else body_for_send,
+                    from_=TWILIO_WHATSAPP_FROM,
+                    to=sender
+                )
+                tts_url = result.get("tts_url")
+                if tts_url:
+                    _twilio_send_and_log(
+                        tw.messages.create,
+                        body=None,
+                        from_=TWILIO_WHATSAPP_FROM,
+                        to=sender,
+                        media_url=[tts_url]
+                    )
+
+        logging.info("BG: finished voice processing for %s", sender)
+
+    except Exception:
+        logging.exception("BG: unexpected failure processing voice note for %s", sender)
+
 
 
 
