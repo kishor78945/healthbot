@@ -770,31 +770,53 @@ def handle_incoming_voice_media_process_only(sender, media_url, content_type):
         return {"success": False, "error": "exception"}
 
 # ----------------- Background worker to process voice note and send via REST -----------------
-def _process_voice_and_send_async(sender, media_url, content_type):
+# ----------------- Background worker to process text and send via REST -----------------
+def _process_text_and_send_async(sender, incoming_msg):
     try:
-        logging.info("BG: starting voice processing for %s", sender)
-        result = handle_incoming_voice_media_process_only(sender, media_url, content_type)
-        if not result or not result.get("success"):
-            logging.warning("BG: voice processing failed for %s: %s", sender, result)
-            if not SKIP_PERSISTENT_SEND:
-                tw = get_twilio_client()
-                if tw:
-                    _twilio_send_and_log(tw.messages.create, body="Sorry, couldn't process your voice note. Please try text or retry the voice note.", from_=TWILIO_WHATSAPP_FROM, to=sender)
-            return
-        transcript = result.get("transcript", "")
-        answer = result.get("answer", "") or TRANSLATIONS["fallback"].get(result.get("lang") or "en")
-        # Send final persistent text message (split if long)
+        logging.info("BG: starting text processing for %s", sender)
+
+        # detect user language
+        set_pref_if_script_detected(sender, incoming_msg)
+        user_lang = user_lang_prefs.get(sender) or detect_lang(incoming_msg)
+
+        # run pipeline
+        try:
+            answer, sources, conf = answer_with_sources(
+                incoming_msg,
+                user_lang=user_lang,
+                top_k=8,
+                doc_threshold=0.22
+            )
+        except Exception:
+            logging.exception("answer pipeline failed for text message")
+            answer = TRANSLATIONS["fallback"].get(user_lang, TRANSLATIONS["fallback"]["en"])
+            sources, conf = None, 0.0
+
+        # choose reply
+        if (("don't know" in (answer or "").lower() or "i do not know" in (answer or "").lower()) 
+            or (conf < 0.05 and len((answer or "").split()) < 6)):
+            reply = TRANSLATIONS["fallback"].get(user_lang, TRANSLATIONS["fallback"]["en"])
+        else:
+            reply = answer
+
+        # send persistent reply via Twilio
         if not SKIP_PERSISTENT_SEND:
             tw = get_twilio_client()
             if tw:
-                body_for_send = f"Q: {transcript}\n\nA: {answer}"
-                _twilio_send_and_log(tw.messages.create, body=body_for_send if len(body_for_send) <= 1600 else body_for_send[:1600] + "...", from_=TWILIO_WHATSAPP_FROM, to=sender)
-                tts_url = result.get("tts_url")
-                if tts_url:
-                    _twilio_send_and_log(tw.messages.create, body=None, from_=TWILIO_WHATSAPP_FROM, to=sender, media_url=[tts_url])
-        logging.info("BG: finished voice processing for %s", sender)
+                body_for_send = reply if len(reply) <= 1600 else reply[:1600] + "..."
+                _twilio_send_and_log(
+                    tw.messages.create,
+                    body=body_for_send,
+                    from_=TWILIO_WHATSAPP_FROM,
+                    to=sender
+                )
+
+        logging.info("BG: finished text processing for %s", sender)
+
     except Exception:
-        logging.exception("BG: unexpected failure processing voice note for %s", sender)
+        logging.exception("BG: unexpected failure processing text for %s", sender)
+
+
 
 # ----------------- /whatsapp webhook -----------------
 @app.route("/whatsapp", methods=["POST"])
@@ -909,34 +931,35 @@ def whatsapp_webhook():
         return str(resp)
 
     # Normal text Q->A
-    last_seen[sender] = int(time.time()); json.dump(last_seen, open(LAST_SEEN_PATH, "w"), ensure_ascii=False)
+      # ---------- Normal text: quick ack + background processing ----------
+    # persist last_seen quickly
     try:
-        set_pref_if_script_detected(sender, incoming_msg)
-        user_lang = user_lang_prefs.get(sender)
-        if not user_lang: user_lang = detect_lang(incoming_msg)
-        logging.info("Webhook: sender=%s incoming_len=%d detected_user_lang=%s", sender, len(incoming_msg or ""), user_lang)
-        answer, sources, conf = answer_with_sources(incoming_msg, user_lang=user_lang, top_k=8, doc_threshold=0.22)
-        if (("don't know" in (answer or "").lower() or "i do not know" in (answer or "").lower()) or (conf < 0.05 and len((answer or "").split()) < 6)):
-            reply = TRANSLATIONS["fallback"].get(user_lang, TRANSLATIONS["fallback"]["en"])
-        else:
-            reply = answer
+        last_seen[sender] = int(time.time())
+        json.dump(last_seen, open(LAST_SEEN_PATH, "w"), ensure_ascii=False)
     except Exception:
-        logging.exception("Processing error")
-        reply = TRANSLATIONS["fallback"]["en"]
+        logging.exception("Failed updating last_seen for %s", sender)
 
-    resp = MessagingResponse(); resp.message(reply)
+    # quick ack to Twilio (so Twilio receives HTTP 200 fast)
+    resp = MessagingResponse()
+    resp.message("✅ Got your message — processing it now. I'll reply here when ready.")
+    try:
+        t = threading.Thread(target=_process_text_and_send_async, args=(sender, incoming_msg), daemon=True)
+        t.start()
+    except Exception:
+        logging.exception("Failed to spawn background thread for text processing; attempting synchronous processing now")
+        # fallback synchronous (slow) processing so the user still gets an answer
+        try:
+            answer, sources, conf = answer_with_sources(incoming_msg, user_lang=user_lang_prefs.get(sender) or detect_lang(incoming_msg), top_k=8, doc_threshold=0.22)
+            short_ans = (answer[:1600] + "...") if answer and len(answer) > 1600 else (answer or TRANSLATIONS["fallback"]["en"])
+            resp = MessagingResponse(); resp.message(short_ans)
+        except Exception:
+            logging.exception("Fallback synchronous processing failed")
+            resp = MessagingResponse(); resp.message(TRANSLATIONS["fallback"]["en"])
 
-    if sender not in seen_users:
-        if user_lang == "ta":
-            help_text = "உதவி: மொழியை மாற்ற LANGUAGE: TAMIL என அனுப்பவும். உதாரணம்: LANGUAGE: TAMIL"
-        elif user_lang == "hi":
-            help_text = "सहायता: भाषा बदलने के लिए LANGUAGE: HINDI भेजें। उदाहरण: LANGUAGE: HINDI"
-        else:
-            help_text = "Help: To change language send LANGUAGE: ENGLISH / HINDI / TAMIL"
-        resp.message(help_text); seen_users.add(sender); persist_seen_users()
-
-    logging.info("OUT | %s | len_reply=%d preview=%s", sender, len(reply or ""), (reply or "")[:200].replace("\n", " "))
+    # Finally return the quick ack to Twilio
+    logging.info("Webhook: acknowledged %s with quick reply", sender)
     return str(resp)
+
 
 # ----------------- Admin endpoints -----------------
 @app.route('/admin/list_alerts', methods=['GET'])
